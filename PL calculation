@@ -1,0 +1,165 @@
+# dataframe consists prices of four contract ZB/ZF/ZNZT from 2015 to 2018, measured in minute scale
+# theare are five columns: timestamp, ZB, ZF, ZN, ZT
+
+#Our goal here is to apply the trading strategy based on cointegration: 
+#use previous four trading day's data(call this formation period),
+#to determine weights of four contracts in today's portfolios(call it trading period),
+#based on criterion that weights shall make portfolio stationary: use Johnsan test to find weights
+#Note:positive weight means we are longing, negative weight means we are shorting
+
+#our strategy is:
+#for each minute in each trading period, calculate previous half day's portfolio signal's mean;
+#and calculate one and two standard deviations from whole 4-day formation period;
+#then, add the one and two standard deviations to the dynamic mean of every minute in trading period
+#if actual prices exceed two standard deviation band, we buy the portfolio
+#then, if actual prices falls back to one standard deviation band, we sell the portfolio
+
+#assume each time we trade, we have same entry capital of 10,000 dollars
+#apply the trading strategy to dataframe, and calculate each day's profit and loss
+#return the P/L result in a readable format csv file
+
+window1 = 4  # 4 days formation
+window2 = 1  # 1 days trading
+monitor_length = int((3/23)*window2*1380)  # length of data used to define trading mean
+contract_names = dataframe.columns  # contract types: ZB/ZF/ZN/ZT
+portfolio = np.full(len(dataframe.index), np.nan).reshape(-1,1)
+mean = np.full(len(dataframe.index), np.nan)
+std = np.full(len(dataframe.index), np.nan)
+reject = np.full(len(dataframe.index), np.nan)
+moni_mean = np.full(len(dataframe.index), np.nan)
+
+i = window1*1380  # first trading period starts index
+count = 1
+date_list = []
+while (i < len(dataframe.index)-window2*1380):
+#while count <= 60:
+    # get trading period calendar
+    calendar = dataframe.index[i:i+window2*1380]
+    date_list.append(calendar.date[-1])
+    
+    # use johansen to find cointegration weights
+    prev_data = dataframe.iloc[i-window1*1380:i, :]  # formation period price
+    fut_data = dataframe.iloc[i:i+window2*1380, :]  # trading period price
+    johansen = Johansen(prev_data, model=2, significance_level=1)
+    eigenvectors, r = johansen.johansen()
+    normalized_weights = eigenvectors[:,0]/eigenvectors[0,0]
+    # form formation and trading portfolio
+    formation_port = pd.Series(np.array((np.matrix(prev_data) * np.matrix(normalized_weights).T).reshape(1,-1))[0],
+                               index = dataframe.index[i-window1*1380:i])
+    trading_port = pd.Series(np.array((np.matrix(fut_data) * np.matrix(normalized_weights).T).reshape(1,-1))[0], 
+                             index = dataframe.index[i:i+window2*1380])
+    
+    # calculate monitor mean and std used for forming bands; calculate formation mean
+    temp_std = np.std(formation_port)
+    monitor_mean = np.mean(trading_port[:monitor_length])
+    temp_mean = np.mean(formation_port)
+    # calculate mean diff of monitor period and formation period; move formation portfolio by the mean diff
+    diff_mean = monitor_mean-temp_mean
+    
+    whole = (formation_port+diff_mean).append(trading_port)
+    
+    portfolio[i:i+window2*1380] = np.matrix(fut_data) * np.matrix(normalized_weights).T
+    std[i:i+window2*1380] = np.full(window2*1380, temp_std)
+    temp_monitor_mean = np.mean(portfolio[i:i+monitor_length])
+    moni_mean[i:i+window2*1380] = np.full(window2*1380, temp_monitor_mean)
+    
+    # generate cointegration break signal
+    rolling_mean = []
+    roll_days = 0.5  # length of days used for moving average
+    for j in range(monitor_length,window2*1380):
+        idx = len(formation_port)+j
+        rolling_mean.append(np.mean(whole.iloc[int(idx-1380*roll_days):idx]))
+        mean[i+j] = np.mean(whole.iloc[int(idx-1380*roll_days):idx])
+    
+    # find cointegration break time
+    rolling_mean = np.array(rolling_mean)
+    detection = np.where((abs(rolling_mean-monitor_mean) > 2*temp_std).astype('float')==1)[0]
+    if (len(detection)>0):
+        #reject_time.append(calendar[monitor_length+detection[0]])
+        reject[i+monitor_length+detection[0]] = 1
+        reject[i+monitor_length+detection[0]+1:i+window2*1380] = 2
+    
+    i = i+window2*1380
+    count += 1
+
+portfolio = pd.Series(portfolio.reshape(1,-1)[0], index=dataframe.index)
+mean = pd.Series(mean, index=dataframe.index)
+std = pd.Series(std, index=dataframe.index)
+#reject = pd.Series(reject, index=dataframe.index)
+buy_opportunity = mean - 2*std
+short_opportunity = mean + 2*std
+end1 = mean - std
+end2 = mean + std
+moni_mean = pd.Series(moni_mean, index=dataframe.index)
+port = pd.concat([portfolio, moni_mean, mean, buy_opportunity, short_opportunity, end1, end2], axis = 1)
+port.columns = ['portfolio', 'mean', 'rolling_mean', 'buy_opportunity', 'short_opportunity', 'buy_end', 'short_end']
+port['trade'] = port.apply(lambda row: "Enter"
+                          if row['portfolio'] <= row['buy_opportunity'] or row['portfolio'] >= row['short_opportunity']
+                          else ("Quit" if (row['portfolio'] >= row['buy_end'] and row['portfolio'] <= row['rolling_mean']) or (row['portfolio'] <= row['short_end'] and row['portfolio'] >= row['rolling_mean'])
+                           else ("Hold" if (row['portfolio'] < row['buy_end'] or row['portfolio'] > row['short_end'])
+                                else "Observe")), axis = 1)
+port['mean_lag'] = port['mean'].shift(1)
+port['trade_lag'] = port['trade'].shift(1)
+port['mean_forward'] = port['mean'].shift(-1)
+port['arbitrage'] = port.apply(lambda row: "Arbitrary_clear" if row['mean'] != row['mean_forward']
+                               else ("Trade_signal" if row['trade'] == 'Enter' and row['trade_lag'] == "Hold" and row['mean'] == row['mean_lag']
+                              else ("Clear_signal" if (row['trade'] == 'Quit' and row['trade_lag'] == "Hold" and row['mean'] == row['mean_lag'])                             
+                                    else "Wait")),axis = 1)
+'''port['arbitrage'] = port.apply(lambda row: "Trade_signal"
+                              if ((row['trade'] == 'Enter') and (row['trade_lag'] == "Hold") and (row['rolling_mean'] == row['mean_lag']) and (row['break'] !=2) and (row['break'] !=1))
+                              else ("Clear_signal" if ((row['trade'] == 'Quit') and (row['trade_lag'] == "Hold") and (row['rolling_mean'] == row['mean_lag']) and (row['break'] !=2)  and (row['break'] !=1))
+                                   else ("Arbitrary_clear" if ((row['rolling_mean'] != row['mean_forward']) and (row['break'] !=2)  and (row['break'] !=1))
+                                         else ("Stop" if row['break'] == 1
+                                        else "Wait"))),axis = 1)'''
+
+signal_pick = port[(port['arbitrage']=='Trade_signal') | (port['arbitrage']=='Clear_signal') | (port['arbitrage']=='Arbitrary_clear')]
+
+#pick the point when we enter a position and quit a position
+signal_pick['arbitrage_lag'] = signal_pick['arbitrage'].shift(1)
+signal_pick['arbitrage_forward'] = signal_pick['arbitrage'].shift(-1)
+signal_pick['count'] = signal_pick.apply(lambda row:"True"
+                                        if (row['arbitrage'] == 'Clear_signal' and row['arbitrage_lag'] == 'Trade_signal') or (row['arbitrage'] == 'Arbitrary-clear' and row['arbitrage_lag'] == 'Trade_signal')
+                                        else "False", axis = 1)
+signal_pick['count1'] = signal_pick.apply(lambda row:"True"
+                                        if (row['arbitrage'] == 'Trade_signal' and row['arbitrage_forward'] == 'Clear_signal') or (row['arbitrage'] == 'Trade_signal' and row['arbitrage_forward'] == 'Arbitrary-clear')
+                                        else "False", axis = 1)
+
+new = signal_pick[(signal_pick['count']=='True') | (signal_pick['count1']=='True')]
+new['long_short'] = new.apply(lambda row:"long"
+                             if ((row['count1']=='True') and (row['portfolio']<=(row['buy_opportunity'])))
+                             else("short" if ((row['count1']=='True') and ((row['portfolio'])>=(row['short_opportunity'])))
+                                 else "none"),axis=1)
+
+count = 0
+temp_profit = 0
+profit = []
+for i in range(0,len(new['long_short'])-1,2):
+    if (((new.index.date[i]==date_list[count]) & (new.index[i].hour<17))
+    or (((new.index.date[i]+timedelta(hours=24))==date_list[count]) & (new.index[i].hour>=17))):
+        print("1",new.index[i],date_list[count])
+        if new['long_short'][i]=="long":
+            temp_profit += abs(100000/new['portfolio'][i])*((new['portfolio'][i+1])-(new['portfolio'][i]))
+        if new['long_short'][i]=="short":
+            temp_profit += abs(100000/new['portfolio'][i])*(-(new['portfolio'][i+1])+(new['portfolio'][i]))
+        print(temp_profit)
+    else:
+        profit.append(temp_profit)
+        #print(profit)
+        interval = (new.index.date[i]-date_list[count]).days
+        for j in range(interval+5):
+            count += 1
+            if ((new.index.date[i]==date_list[count]) & (new.index[i].hour<17)) | ((new.index.date[i]+timedelta(hours=24)==date_list[count])&(new.index[i].hour>=17)):
+                break
+            profit.append(0)
+        
+        temp_profit = 0
+        if new['long_short'][i]=="long":
+            temp_profit += abs(100000/new['portfolio'][i])*((new['portfolio'][i+1])-(new['portfolio'][i]))
+        if new['long_short'][i]=="short":
+            temp_profit += abs(100000/new['portfolio'][i])*(-(new['portfolio'][i+1])+(new['portfolio'][i]))
+        print("2",new.index[i],date_list[count])
+        print(temp_profit)
+profit.append(temp_profit)
+
+profit_data = pd.DataFrame({"date":date_list, "profit":profit})
+profit_data
